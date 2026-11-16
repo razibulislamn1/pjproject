@@ -50,33 +50,51 @@ on:
 
 jobs:
   aar:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
       - name: Tools
-        run: sudo apt-get update && sudo apt-get install -y swig ninja-build zip unzip
+        run: |
+          echo "== STEP: install tools"
+          sudo apt-get update && sudo apt-get install -y swig ninja-build zip unzip
 
       - name: Selected options
         env:
           SEL: ${{ toJson(inputs) }}
         run: |
+          echo "== STEP: selected options"
           echo "### Selected options" >> "$GITHUB_STEP_SUMMARY"
           echo '```json' >> "$GITHUB_STEP_SUMMARY"
           echo "$SEL" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "$SEL"
 
+      - name: Patch 16KB check (32-bit exempt)
+        run: |
+          echo "== STEP: patch alignment check"
+          python3 - <<'EOF'
+          p = 'build/android/build-aar.sh'
+          s = open(p).read()
+          old = '[ "$((align))" -ge 16384 ] || {'
+          new = '[ "$((align))" -ge "$([ "$abi" = armeabi-v7a ] && echo 4096 || echo 16384)" ] || {'
+          assert old in s, "alignment line not found in build-aar.sh"
+          open(p, 'w').write(s.replace(old, new))
+          print("patched OK")
+          EOF
+          grep -n 'armeabi-v7a' build/android/build-aar.sh | head
+
       - name: Video on/off
         env:
           VIDEO: ${{ inputs.video }}
         run: |
+          echo "== STEP: video=$VIDEO"
           if [ "$VIDEO" != "true" ]; then
             echo "Video OFF: patching build-aar.sh"
             sed -i \
@@ -100,6 +118,7 @@ jobs:
           IPV6: ${{ inputs.ipv6 }}
           RTP_KA: ${{ inputs.rtp_keepalive }}
         run: |
+          echo "== STEP: config_site.h"
           python3 - <<'EOF'
           import os
           best = os.environ['QUALITY'].startswith('Best')
@@ -148,14 +167,19 @@ jobs:
         env:
           ABI_CHOICE: ${{ inputs.abi }}
         run: |
+          set -o pipefail
+          echo "== STEP: build AAR"
           case "$ABI_CHOICE" in
             "64-bit (arm64-v8a)")  export ABIS="arm64-v8a" ;;
             "32-bit (armeabi-v7a)") export ABIS="armeabi-v7a" ;;
             *) export ABIS="arm64-v8a armeabi-v7a" ;;
           esac
-          echo "ABIS=$ABIS"
           export ANDROID_NDK_ROOT="$ANDROID_NDK_LATEST_HOME"
-          ./build/android/build-aar.sh
+          echo "ABIS=$ABIS"
+          echo "NDK=$ANDROID_NDK_ROOT"
+          grep Pkg.Revision "$ANDROID_NDK_ROOT/source.properties" || true
+          cmake --version | head -1
+          ./build/android/build-aar.sh 2>&1 | tee build.log
 
       - name: Package (rename / DSP merge)
         env:
@@ -163,11 +187,14 @@ jobs:
           MERGE: ${{ inputs.merge_dsp }}
         run: |
           set -eu
+          echo "== STEP: package (rename=$RENAME merge=$MERGE)"
           SRC=$(ls out-android/dist/*.aar | head -1)
+          echo "source AAR: $SRC"
           W=$PWD/work; rm -rf "$W"; mkdir -p "$W" final
           unzip -q "$SRC" -d "$W"
           if [ "$RENAME" = "true" ]; then
             for d in "$W"/jni/*; do
+              echo "rename $d"
               mv "$d/libpjsua2.so" "$d/libserver2.so"
             done
           fi
@@ -178,6 +205,7 @@ jobs:
             unzip -q "$OLD" -d "$O"
             for d in "$W"/jni/*; do
               abi=$(basename "$d")
+              echo "merge DSP into $abi"
               cp "$O/jni/$abi/libsoftdial_dsp.so" "$d/"
               [ -f "$d/libc++_shared.so" ] || cp "$O/jni/$abi/libc++_shared.so" "$d/"
             done
@@ -185,10 +213,54 @@ jobs:
             (cd "$C" && unzip -q "$O/classes.jar" 'com/softdial/dsp/*' && zip -qr "$W/classes.jar" com)
           fi
           (cd "$W" && zip -qr -X "$OLDPWD/final/pjsua2-release.aar" .)
-          ls -l final; unzip -l final/pjsua2-release.aar | grep -E 'jni/|classes.jar'
+          ls -l final
+          unzip -l final/pjsua2-release.aar | grep -E 'jni/|classes.jar'
           sha256sum final/pjsua2-release.aar > final/SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
           name: pjsua2-release-aar
           path: final/*
+
+      - name: Diagnostics (fail hole)
+        if: failure()
+        run: |
+          echo "== STEP: diagnostics"
+          mkdir -p diag
+          {
+            echo "## Diagnostics"
+            echo "date: $(date -u)"
+            echo "NDK: $ANDROID_NDK_LATEST_HOME"
+            grep Pkg.Revision "$ANDROID_NDK_LATEST_HOME/source.properties" || true
+            cmake --version | head -1
+            swig -version | head -3
+            java -version 2>&1 | head -1
+            df -h . | tail -1
+            echo "--- build.log (last 80 lines)"
+            tail -80 build.log || true
+            echo "--- stage logs"
+            ls -l out-android/stage 2>/dev/null || true
+            for f in out-android/stage/*.log; do
+              [ -f "$f" ] || continue
+              echo "--- $f (last 40 lines)"
+              tail -40 "$f"
+            done
+            echo "--- ELF LOAD alignment"
+            RE=$(find "$ANDROID_NDK_LATEST_HOME" -name llvm-readelf | head -1)
+            for so in $(find out-android -name 'libpjsua2.so' 2>/dev/null); do
+              echo "$so"
+              "$RE" -l "$so" | awk '$1=="LOAD"{print "  align " $NF}'
+            done
+            echo "--- config_site.h (tail)"
+            tail -45 build/android/config_site.h
+          } > diag/diagnostics.txt 2>&1 || true
+          cp out-android/stage/*.log diag/ 2>/dev/null || true
+          cp build.log diag/ 2>/dev/null || true
+          { echo '## Diagnostics (fail)'; echo '```'; tail -120 diag/diagnostics.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics
+          path: diag/*
