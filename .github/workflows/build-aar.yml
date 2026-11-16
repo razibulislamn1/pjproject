@@ -10,12 +10,41 @@ on:
           - "64-bit (arm64-v8a)"
           - "32-bit (armeabi-v7a)"
           - "64-bit + 32-bit (dutoi)"
+      quality:
+        description: "Voice quality mode (complexity + resampler)"
+        type: choice
+        default: "Best (max quality)"
+        options:
+          - "Best (max quality)"
+          - "Balanced (kom CPU)"
+      opus_kbps:
+        description: "Opus max bitrate (kbps)"
+        type: choice
+        default: "64"
+        options: ["64", "48", "32", "24"]
+      sip_keepalive:
+        description: "TCP/TLS SIP keep-alive (second)"
+        type: choice
+        default: "30"
+        options: ["15", "30", "60", "90"]
+      video:
+        description: "Video call (camera + H264/VP8/VP9)"
+        type: boolean
+        default: true
+      ipv6:
+        description: "IPv6 support"
+        type: boolean
+        default: true
+      rtp_keepalive:
+        description: "RTP keep-alive (mobile data NAT)"
+        type: boolean
+        default: true
       rename_server2:
-        description: "libpjsua2.so -> libserver2.so rename (app server2 load kore)"
+        description: "libpjsua2.so -> libserver2.so rename"
         type: boolean
         default: true
       merge_dsp:
-        description: "Ager AAR theke libsoftdial_dsp.so + SoftDialDsp merge (repo-te old/pjsua2-release.aar lagbe)"
+        description: "Ager AAR theke libsoftdial_dsp.so merge (repo-te old/pjsua2-release.aar lagbe)"
         type: boolean
         default: false
 
@@ -34,39 +63,81 @@ jobs:
       - name: Tools
         run: sudo apt-get update && sudo apt-get install -y swig ninja-build zip unzip
 
+      - name: Selected options
+        env:
+          SEL: ${{ toJson(inputs) }}
+        run: |
+          echo "### Selected options" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          echo "$SEL" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$SEL"
+
+      - name: Video on/off
+        env:
+          VIDEO: ${{ inputs.video }}
+        run: |
+          if [ "$VIDEO" != "true" ]; then
+            echo "Video OFF: patching build-aar.sh"
+            sed -i \
+              -e 's/PJMEDIA_WITH_VIDEO=ON/PJMEDIA_WITH_VIDEO=OFF/' \
+              -e 's/PJMEDIA_WITH_VIDEODEV_ANDROID=ON/PJMEDIA_WITH_VIDEODEV_ANDROID=OFF/' \
+              -e 's/PJMEDIA_WITH_VIDEODEV_OPENGL=ON/PJMEDIA_WITH_VIDEODEV_OPENGL=OFF/' \
+              -e 's/PJMEDIA_WITH_VIDEO:ON/PJMEDIA_WITH_VIDEO:OFF/' \
+              -e 's/PJMEDIA_WITH_VIDEODEV_ANDROID:ON/PJMEDIA_WITH_VIDEODEV_ANDROID:OFF/' \
+              -e 's/PJMEDIA_WITH_VIDEODEV_OPENGL:ON/PJMEDIA_WITH_VIDEODEV_OPENGL:OFF/' \
+              build/android/build-aar.sh
+            grep -n -E 'VIDEO' build/android/build-aar.sh | head -20
+          else
+            echo "Video ON"
+          fi
+
       - name: Quality + Network config
+        env:
+          QUALITY: ${{ inputs.quality }}
+          OPUS_KBPS: ${{ inputs.opus_kbps }}
+          SIP_KA: ${{ inputs.sip_keepalive }}
+          IPV6: ${{ inputs.ipv6 }}
+          RTP_KA: ${{ inputs.rtp_keepalive }}
         run: |
           python3 - <<'EOF'
+          import os
+          best = os.environ['QUALITY'].startswith('Best')
+          codecq = 10 if best else 8
+          speexq = 8 if best else 6
+          opus_cx = 10 if best else 8
+          opus_br = int(os.environ['OPUS_KBPS']) * 1000
+          sip_ka = int(os.environ['SIP_KA'])
+          ipv6 = 1 if os.environ['IPV6'] == 'true' else 0
+          rtp_ka = 1 if os.environ['RTP_KA'] == 'true' else 0
           p = 'build/android/config_site.h'
           s = open(p).read()
-          extra = '''
+          extra = f'''
           /* ===== SoftDial: VOICE QUALITY ===== */
           #undef PJSUA_DEFAULT_CODEC_QUALITY
-          #define PJSUA_DEFAULT_CODEC_QUALITY 10
+          #define PJSUA_DEFAULT_CODEC_QUALITY {codecq}
           #undef PJMEDIA_CODEC_SPEEX_DEFAULT_QUALITY
-          #define PJMEDIA_CODEC_SPEEX_DEFAULT_QUALITY 8
-          /* Opus: full range (Opus nijei 8k..64k adjust kore), max complexity */
+          #define PJMEDIA_CODEC_SPEEX_DEFAULT_QUALITY {speexq}
           #undef PJMEDIA_CODEC_OPUS_DEFAULT_COMPLEXITY
-          #define PJMEDIA_CODEC_OPUS_DEFAULT_COMPLEXITY 10
+          #define PJMEDIA_CODEC_OPUS_DEFAULT_COMPLEXITY {opus_cx}
           #undef PJMEDIA_CODEC_OPUS_DEFAULT_BIT_RATE
-          #define PJMEDIA_CODEC_OPUS_DEFAULT_BIT_RATE 64000
-          /* HD video keyframe buffer 512KB */
+          #define PJMEDIA_CODEC_OPUS_DEFAULT_BIT_RATE {opus_br}
           #undef PJMEDIA_MAX_VIDEO_ENC_FRAME_SIZE
           #define PJMEDIA_MAX_VIDEO_ENC_FRAME_SIZE (1<<19)
 
-          /* ===== SoftDial: MOBILE DATA / NETWORK ===== */
+          /* ===== SoftDial: NETWORK ===== */
           #undef PJ_HAS_IPV6
-          #define PJ_HAS_IPV6 1
+          #define PJ_HAS_IPV6 {ipv6}
           #undef PJ_ICE_MAX_CAND
           #define PJ_ICE_MAX_CAND 32
           #undef PJMEDIA_STREAM_ENABLE_KA
-          #define PJMEDIA_STREAM_ENABLE_KA 1
+          #define PJMEDIA_STREAM_ENABLE_KA {rtp_ka}
           #undef PJMEDIA_STREAM_KA_INTERVAL
           #define PJMEDIA_STREAM_KA_INTERVAL 5
           #undef PJSIP_TCP_KEEP_ALIVE_INTERVAL
-          #define PJSIP_TCP_KEEP_ALIVE_INTERVAL 30
+          #define PJSIP_TCP_KEEP_ALIVE_INTERVAL {sip_ka}
           #undef PJSIP_TLS_KEEP_ALIVE_INTERVAL
-          #define PJSIP_TLS_KEEP_ALIVE_INTERVAL 30
+          #define PJSIP_TLS_KEEP_ALIVE_INTERVAL {sip_ka}
           '''
           i = s.rindex('#endif')
           open(p, 'w').write(s[:i] + extra + s[i:])
