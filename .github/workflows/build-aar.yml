@@ -1,0 +1,123 @@
+name: Build SoftDial AAR
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "Kon bit?"
+        type: choice
+        default: "64-bit + 32-bit (dutoi)"
+        options:
+          - "64-bit (arm64-v8a)"
+          - "32-bit (armeabi-v7a)"
+          - "64-bit + 32-bit (dutoi)"
+      rename_server2:
+        description: "libpjsua2.so -> libserver2.so rename (app server2 load kore)"
+        type: boolean
+        default: true
+      merge_dsp:
+        description: "Ager AAR theke libsoftdial_dsp.so + SoftDialDsp merge (repo-te old/pjsua2-release.aar lagbe)"
+        type: boolean
+        default: false
+
+jobs:
+  aar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y swig ninja-build zip unzip
+
+      - name: Quality + Network config
+        run: |
+          python3 - <<'EOF'
+          p = 'build/android/config_site.h'
+          s = open(p).read()
+          extra = '''
+          /* ===== SoftDial: VOICE QUALITY ===== */
+          #undef PJSUA_DEFAULT_CODEC_QUALITY
+          #define PJSUA_DEFAULT_CODEC_QUALITY 10
+          #undef PJMEDIA_CODEC_SPEEX_DEFAULT_QUALITY
+          #define PJMEDIA_CODEC_SPEEX_DEFAULT_QUALITY 8
+          /* Opus: full range (Opus nijei 8k..64k adjust kore), max complexity */
+          #undef PJMEDIA_CODEC_OPUS_DEFAULT_COMPLEXITY
+          #define PJMEDIA_CODEC_OPUS_DEFAULT_COMPLEXITY 10
+          #undef PJMEDIA_CODEC_OPUS_DEFAULT_BIT_RATE
+          #define PJMEDIA_CODEC_OPUS_DEFAULT_BIT_RATE 64000
+          /* HD video keyframe buffer 512KB */
+          #undef PJMEDIA_MAX_VIDEO_ENC_FRAME_SIZE
+          #define PJMEDIA_MAX_VIDEO_ENC_FRAME_SIZE (1<<19)
+
+          /* ===== SoftDial: MOBILE DATA / NETWORK ===== */
+          #undef PJ_HAS_IPV6
+          #define PJ_HAS_IPV6 1
+          #undef PJ_ICE_MAX_CAND
+          #define PJ_ICE_MAX_CAND 32
+          #undef PJMEDIA_STREAM_ENABLE_KA
+          #define PJMEDIA_STREAM_ENABLE_KA 1
+          #undef PJMEDIA_STREAM_KA_INTERVAL
+          #define PJMEDIA_STREAM_KA_INTERVAL 5
+          #undef PJSIP_TCP_KEEP_ALIVE_INTERVAL
+          #define PJSIP_TCP_KEEP_ALIVE_INTERVAL 30
+          #undef PJSIP_TLS_KEEP_ALIVE_INTERVAL
+          #define PJSIP_TLS_KEEP_ALIVE_INTERVAL 30
+          '''
+          i = s.rindex('#endif')
+          open(p, 'w').write(s[:i] + extra + s[i:])
+          EOF
+          tail -40 build/android/config_site.h
+
+      - name: Build AAR
+        env:
+          ABI_CHOICE: ${{ inputs.abi }}
+        run: |
+          case "$ABI_CHOICE" in
+            "64-bit (arm64-v8a)")  export ABIS="arm64-v8a" ;;
+            "32-bit (armeabi-v7a)") export ABIS="armeabi-v7a" ;;
+            *) export ABIS="arm64-v8a armeabi-v7a" ;;
+          esac
+          echo "ABIS=$ABIS"
+          export ANDROID_NDK_ROOT="$ANDROID_NDK_LATEST_HOME"
+          ./build/android/build-aar.sh
+
+      - name: Package (rename / DSP merge)
+        env:
+          RENAME: ${{ inputs.rename_server2 }}
+          MERGE: ${{ inputs.merge_dsp }}
+        run: |
+          set -eu
+          SRC=$(ls out-android/dist/*.aar | head -1)
+          W=$PWD/work; rm -rf "$W"; mkdir -p "$W" final
+          unzip -q "$SRC" -d "$W"
+          if [ "$RENAME" = "true" ]; then
+            for d in "$W"/jni/*; do
+              mv "$d/libpjsua2.so" "$d/libserver2.so"
+            done
+          fi
+          if [ "$MERGE" = "true" ]; then
+            OLD=old/pjsua2-release.aar
+            test -f "$OLD" || { echo "::error::$OLD repo-te nai"; exit 1; }
+            O=$PWD/oldx; rm -rf "$O"; mkdir -p "$O"
+            unzip -q "$OLD" -d "$O"
+            for d in "$W"/jni/*; do
+              abi=$(basename "$d")
+              cp "$O/jni/$abi/libsoftdial_dsp.so" "$d/"
+              [ -f "$d/libc++_shared.so" ] || cp "$O/jni/$abi/libc++_shared.so" "$d/"
+            done
+            C=$PWD/cls; rm -rf "$C"; mkdir -p "$C"
+            (cd "$C" && unzip -q "$O/classes.jar" 'com/softdial/dsp/*' && zip -qr "$W/classes.jar" com)
+          fi
+          (cd "$W" && zip -qr -X "$OLDPWD/final/pjsua2-release.aar" .)
+          ls -l final; unzip -l final/pjsua2-release.aar | grep -E 'jni/|classes.jar'
+          sha256sum final/pjsua2-release.aar > final/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pjsua2-release-aar
+          path: final/*
